@@ -2,6 +2,7 @@ from typing import List
 
 import numpy as np
 from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 
 
@@ -55,12 +56,12 @@ def run_typical_ope(
     """Estimate the long-term expected reward under a given policy via typical OPE (IPS and DR), which does not utilize short-term rewards."""
     n_data = D_H["n_data"]
     r, actions = D_H["r"], D_H["actions"]
-    pi_0 = D_H["pi_0"]
+    pi_0 = D_H["pi_b"]
     q_x_a_hat = estimate_q_x_a_via_regression(D_H, q_x_a_model=q_x_a_model)
     
     estimated_values = dict()
     factual_q_x_a_hat = q_x_a_hat[np.arange(n_data), actions]
-    for i, policy in enumerate(["pi_0", "new_pi"]):
+    for i, policy in enumerate(["pi_b", "pi_e"]):
         pi_i = D_H[policy]
         iw = pi_i[np.arange(n_data), actions] / pi_0[np.arange(n_data), actions]
         estimated_values[f"ips{i}"] = (iw * r).mean()
@@ -79,7 +80,7 @@ def run_long_term_ope(
     """Estimate the long-term expected reward under a given policy via long-term OPE (ours), which combines short- and long-term rewards in the historical data."""
     n_data = D_H["n_data"]
     x_s, r, actions = D_H["x_s"], D_H["r"], D_H["actions"]
-    pi_0 = D_H["pi_0"]
+    pi_0 = D_H["pi_b"]
     q_x_a_hat = estimate_q_x_a_via_regression(D_H, q_x_a_model=q_x_a_model)
     
     x_s_ = np.concatenate([D_H["x_s"], D_E_0["x_s"]])
@@ -91,13 +92,64 @@ def run_long_term_ope(
     
     estimated_values = dict()
     factual_q_x_a_hat = q_x_a_hat[np.arange(n_data), actions]
-    for i, policy in enumerate(["pi_0", "new_pi"]):
+    for i, policy in enumerate(["pi_b", "pi_e"]):
         pi_i = D_H[policy]
         iw_hat = ((pi_i / pi_0) * pi_a_x_s_hat).sum(1)
         q_x_pi_hat = (q_x_a_hat * pi_i).sum(1)
         estimated_values[i] = (iw_hat * (r - factual_q_x_a_hat) + q_x_pi_hat).mean()
     
     return estimated_values
+
+
+def _summarize_weights(weights: np.ndarray) -> dict:
+    return {
+        "mean": float(np.mean(weights)),
+        "std": float(np.std(weights)),
+        "min": float(np.min(weights)),
+        "max": float(np.max(weights)),
+    }
+
+
+def get_importance_weight_summary(D_H: dict, D_E_0: dict) -> dict:
+    """Return summary statistics for the importance weights used by each method."""
+    n_data = D_H["n_data"]
+    actions = D_H["actions"]
+    pi_b = D_H["pi_b"]
+    pi_e = D_H["pi_e"]
+
+    summaries = {
+        "long_term_experiment": {"baseline": None, "new_policy": None},
+        "long_term_ci": {"baseline": None, "new_policy": None},
+    }
+
+    iw_baseline = pi_b[np.arange(n_data), actions] / pi_b[np.arange(n_data), actions]
+    iw_new = pi_e[np.arange(n_data), actions] / pi_b[np.arange(n_data), actions]
+    summaries["typical_ope_ips"] = {
+        "baseline": _summarize_weights(iw_baseline),
+        "new_policy": _summarize_weights(iw_new),
+    }
+    summaries["typical_ope_dr"] = {
+        "baseline": _summarize_weights(iw_baseline),
+        "new_policy": _summarize_weights(iw_new),
+    }
+
+    x_s_ = np.concatenate([D_H["x_s"], D_E_0["x_s"]])
+    actions_ = np.concatenate([actions, D_E_0["actions"]])
+    observed_action_set = np.unique(actions_)
+    pi_a_x_s_model = MLPClassifier(hidden_layer_sizes=(10, 10, 10), random_state=12345)
+    pi_a_x_s_model.fit(x_s_, actions_)
+
+    pi_a_x_s_hat = np.zeros(shape=(n_data, D_H["n_actions"]))
+    pi_a_x_s_hat[:, observed_action_set] = pi_a_x_s_model.predict_proba(D_H["x_s"])
+
+    iw_hat_baseline = ((pi_b / pi_b) * pi_a_x_s_hat).sum(1)
+    iw_hat_new = ((pi_e / pi_b) * pi_a_x_s_hat).sum(1)
+    summaries["long_term_ope"] = {
+        "baseline": _summarize_weights(iw_hat_baseline),
+        "new_policy": _summarize_weights(iw_hat_new),
+    }
+
+    return summaries
 
 
 def run_all(D_H: dict, D_E_list: List[dict]) -> List[dict]:
