@@ -2,6 +2,7 @@ from typing import List
 
 import numpy as np
 from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 
 
@@ -17,7 +18,7 @@ def run_long_term_experiment(D_E_list: List[dict]):
 def run_long_term_ci(
     D_H: dict, 
     D_E_list: List[dict], 
-    g_x_s_model = MLPRegressor(hidden_layer_sizes=(10, 10, 10), random_state=12345),
+    g_x_s_model = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=12345),
 ) -> float:
     """Estimate the long-term expected reward under a given policy via long-term causal inference based on the surrogacy assumption."""
     estimated_values = dict()
@@ -30,7 +31,7 @@ def run_long_term_ci(
 
 def estimate_q_x_a_via_regression(
     D_H: dict, 
-    q_x_a_model = MLPRegressor(hidden_layer_sizes=(10, 10, 10), random_state=12345)
+    q_x_a_model = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=12345)
 ) -> np.ndarray:
     """Estimate the expected reward function (`q(x,a)`), which is used for DR."""
     n_data, n_actions = D_H["n_data"], D_H["n_actions"]
@@ -50,17 +51,17 @@ def estimate_q_x_a_via_regression(
 
 def run_typical_ope(
     D_H: dict,
-    q_x_a_model = MLPRegressor(hidden_layer_sizes=(10, 10, 10), random_state=12345),
+    q_x_a_model = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=12345),
 ) -> float:
     """Estimate the long-term expected reward under a given policy via typical OPE (IPS and DR), which does not utilize short-term rewards."""
     n_data = D_H["n_data"]
     r, actions = D_H["r"], D_H["actions"]
-    pi_0 = D_H["pi_0"]
+    pi_0 = D_H["pi_b"]
     q_x_a_hat = estimate_q_x_a_via_regression(D_H, q_x_a_model=q_x_a_model)
     
     estimated_values = dict()
     factual_q_x_a_hat = q_x_a_hat[np.arange(n_data), actions]
-    for i, policy in enumerate(["pi_0", "new_pi"]):
+    for i, policy in enumerate(["pi_b", "pi_e"]):
         pi_i = D_H[policy]
         iw = pi_i[np.arange(n_data), actions] / pi_0[np.arange(n_data), actions]
         estimated_values[f"ips{i}"] = (iw * r).mean()
@@ -73,13 +74,13 @@ def run_typical_ope(
 
 def run_long_term_ope(
     D_H: dict, D_E_0: dict,
-    q_x_a_model = MLPRegressor(hidden_layer_sizes=(10, 10, 10), random_state=12345),
+    q_x_a_model = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=12345),
     pi_a_x_s_model = MLPClassifier(hidden_layer_sizes=(10, 10, 10), random_state=12345),
 ) -> float:
     """Estimate the long-term expected reward under a given policy via long-term OPE (ours), which combines short- and long-term rewards in the historical data."""
     n_data = D_H["n_data"]
     x_s, r, actions = D_H["x_s"], D_H["r"], D_H["actions"]
-    pi_0 = D_H["pi_0"]
+    pi_0 = D_H["pi_b"]
     q_x_a_hat = estimate_q_x_a_via_regression(D_H, q_x_a_model=q_x_a_model)
     
     x_s_ = np.concatenate([D_H["x_s"], D_E_0["x_s"]])
@@ -91,7 +92,7 @@ def run_long_term_ope(
     
     estimated_values = dict()
     factual_q_x_a_hat = q_x_a_hat[np.arange(n_data), actions]
-    for i, policy in enumerate(["pi_0", "new_pi"]):
+    for i, policy in enumerate(["pi_b", "pi_e"]):
         pi_i = D_H[policy]
         iw_hat = ((pi_i / pi_0) * pi_a_x_s_hat).sum(1)
         q_x_pi_hat = (q_x_a_hat * pi_i).sum(1)
@@ -99,97 +100,78 @@ def run_long_term_ope(
     
     return estimated_values
 
-# =====================================================================
-# 🌟 本研究の核心：LOPEに対するGMSM（区間推定）の主問題形式実装
-# =====================================================================
-def run_long_term_ope_gmsm(
-    D_H: dict, D_E_0: dict, gamma: float = 1.2,
-    q_x_a_model = MLPRegressor(hidden_layer_sizes=(10, 10, 10), random_state=12345),
-    pi_a_x_s_model = MLPClassifier(hidden_layer_sizes=(10, 10, 10), random_state=12345),
-) -> dict:
-    """Estimate the sharp lower and upper bounds of LOPE under the Marginal Sensitivity Model (GMSM)."""
+
+def _summarize_weights(weights: np.ndarray) -> dict:
+    return {
+        "mean": float(np.mean(weights)),
+        "std": float(np.std(weights)),
+        "min": float(np.min(weights)),
+        "max": float(np.max(weights)),
+    }
+
+
+def get_importance_weight_summary(D_H: dict, D_E_0: dict) -> dict:
+    """Return summary statistics for the importance weights used by each method."""
     n_data = D_H["n_data"]
-    x_s, r, actions = D_H["x_s"], D_H["r"], D_H["actions"]
-    pi_0 = D_H["pi_0"]
-    q_x_a_hat = estimate_q_x_a_via_regression(D_H, q_x_a_model=q_x_a_model)
-    
-    # 条件付き選択確率 pi(a|x,s) の学習と予測
+    actions = D_H["actions"]
+    pi_b = D_H["pi_b"]
+    pi_e = D_H["pi_e"]
+
+    summaries = {
+        "long_term_experiment": {"baseline": None, "new_policy": None},
+        "long_term_ci": {"baseline": None, "new_policy": None},
+    }
+
+    iw_baseline = pi_b[np.arange(n_data), actions] / pi_b[np.arange(n_data), actions]
+    iw_new = pi_e[np.arange(n_data), actions] / pi_b[np.arange(n_data), actions]
+    summaries["typical_ope_ips"] = {
+        "baseline": _summarize_weights(iw_baseline),
+        "new_policy": _summarize_weights(iw_new),
+    }
+    summaries["typical_ope_dr"] = {
+        "baseline": _summarize_weights(iw_baseline),
+        "new_policy": _summarize_weights(iw_new),
+    }
+
     x_s_ = np.concatenate([D_H["x_s"], D_E_0["x_s"]])
     actions_ = np.concatenate([actions, D_E_0["actions"]])
     observed_action_set = np.unique(actions_)
+    pi_a_x_s_model = MLPClassifier(hidden_layer_sizes=(10, 10, 10), random_state=12345)
     pi_a_x_s_model.fit(x_s_, actions_)
+
     pi_a_x_s_hat = np.zeros(shape=(n_data, D_H["n_actions"]))
-    pi_a_x_s_hat[:, observed_action_set] = pi_a_x_s_model.predict_proba(x_s)
-    
-    w_min = 1.0 / gamma
-    w_max = gamma
-    
-    bounds = {"lower": {}, "upper": {}}
-    factual_q_x_a_hat = q_x_a_hat[np.arange(n_data), actions]
-    
-    for i, policy in enumerate(["pi_0", "new_pi"]):
-        pi_i = D_H[policy]
-        iw_hat = ((pi_i / pi_0) * pi_a_x_s_hat).sum(1)
-        q_x_pi_hat = (q_x_a_hat * pi_i).sum(1)
-        
-        # 🌟未観測交絡（MSMウェイト）の影響を受ける短期サロゲート残差項 (Term 1)
-        base_values = iw_hat * (r - factual_q_x_a_hat)
-        # 未観測交絡の影響を受けない決定論的な固定期待値項 (Term 2)
-        term2 = q_x_pi_hat.mean()
-        
-        # 効率的に最悪ケースのウェイトを配分するためのソートパズル
-        sorted_indices_desc = np.argsort(base_values)[::-1]
-        
-        # --- Upper Bound (上限) の計算 ---
-        omega_upper = np.full(n_data, w_min)
-        remaining_budget_upper = n_data - (n_data * w_min)
-        for idx in sorted_indices_desc:
-            alloc = min(remaining_budget_upper, w_max - w_min)
-            omega_upper[idx] += alloc
-            remaining_budget_upper -= alloc
-            if remaining_budget_upper <= 0:
-                break
-        bounds["upper"][i] = (omega_upper * base_values).mean() + term2
-        
-        # --- Lower Bound (下限) の計算 ---
-        omega_lower = np.full(n_data, w_max)
-        remaining_budget_lower = (n_data * w_max) - n_data
-        for idx in sorted_indices_desc:
-            alloc = min(remaining_budget_lower, w_max - w_min)
-            omega_lower[idx] -= alloc
-            remaining_budget_lower -= alloc
-            if remaining_budget_lower <= 0:
-                break
-        bounds["lower"][i] = (omega_lower * base_values).mean() + term2
-        
-    return bounds
+    pi_a_x_s_hat[:, observed_action_set] = pi_a_x_s_model.predict_proba(D_H["x_s"])
+
+    iw_hat_baseline = ((pi_b / pi_b) * pi_a_x_s_hat).sum(1)
+    iw_hat_new = ((pi_e / pi_b) * pi_a_x_s_hat).sum(1)
+    summaries["long_term_ope"] = {
+        "baseline": _summarize_weights(iw_hat_baseline),
+        "new_policy": _summarize_weights(iw_hat_new),
+    }
+
+    return summaries
 
 
-def run_all(D_H: dict, D_E_list: List[dict], gamma: float = 1.2) -> List[dict]:
+def run_all(D_H: dict, D_E_list: List[dict]) -> List[dict]:
     """Run all methods to estimate the long-term expected reward under a given policy simultaneously."""
     long_term_experiment = run_long_term_experiment(D_E_list)
     long_term_ci = run_long_term_ci(D_H, D_E_list)
     typical_ope = run_typical_ope(D_H)
     long_term_ope = run_long_term_ope(D_H, D_E_list[0])
-    lope_gmsm_bounds = run_long_term_ope_gmsm(D_H, D_E_list[0], gamma=gamma)
     
     estimated_values_of_baseline = {
         "long_term_experiment": long_term_experiment[0],
         "long_term_ci": long_term_ci[0],
         "typical_ope_ips": typical_ope["ips0"],
         "typical_ope_dr": typical_ope["dr0"],
-        "long_term_ope": long_term_ope[0],
-        "proposed_lope_gmsm_lower": lope_gmsm_bounds["lower"][0], # 追加
-        "proposed_lope_gmsm_upper": lope_gmsm_bounds["upper"][0]  # 追加
+        "long_term_ope": long_term_ope[0]
     }
     estimated_values_of_new_policy = {
         "long_term_experiment": long_term_experiment[1],
         "long_term_ci": long_term_ci[1],
         "typical_ope_ips": typical_ope["ips1"],
         "typical_ope_dr": typical_ope["dr1"],
-        "long_term_ope": long_term_ope[1],
-        "proposed_lope_gmsm_lower": lope_gmsm_bounds["lower"][1], # 追加
-        "proposed_lope_gmsm_upper": lope_gmsm_bounds["upper"][1]  # 追加
+        "long_term_ope": long_term_ope[1]
     }
     estimated_policy_comparison = dict()
     for method in estimated_values_of_new_policy:
